@@ -32,9 +32,7 @@ const publicDir = path.join(projectRoot, 'public');
 const OPTIMIZED_IMAGES_SUBDIR = 'picture';
 const optimizedThumbnailsDir = path.join(publicDir, OPTIMIZED_IMAGES_SUBDIR);
 
-// --- Perubahan Utama: Output ke src/data/allVideos.ts ---
 const OUTPUT_TS_PATH = path.resolve(__dirname, '../data/allVideos.ts');
-// --- AKHIR Perubahan Utama ---
 
 const YOUR_DOMAIN = url;
 if (!YOUR_DOMAIN) {
@@ -47,88 +45,104 @@ const DEFAULT_FALLBACK_WIDTH = 300;
 const DEFAULT_FALLBACK_HEIGHT = 168;
 const OPTIMIZED_THUMBNAIL_WIDTH = 300;
 
+// Konfigurasi untuk paralelisme
+const CONCURRENCY_LIMIT = 5; // Batasi berapa banyak thumbnail yang diproses bersamaan
+
 async function processThumbnails() {
     console.log('Starting thumbnail processing...');
 
-    // Pastikan direktori untuk thumbnail yang dioptimalkan ada di public/picture
     await fs.mkdir(optimizedThumbnailsDir, { recursive: true });
-
-    // --- Perubahan: Pastikan direktori output TS juga ada ---
     const outputTsDir = path.dirname(OUTPUT_TS_PATH);
     await fs.mkdir(outputTsDir, { recursive: true });
-    // --- AKHIR Perubahan ---
 
     const processedVideos = [];
+    const processingPromises = []; // Array untuk menyimpan semua promise pemrosesan
 
     for (const video of videosData) {
         const videoSlug = slugify(video.title || 'untitled-video');
         const thumbnailFileName = `${videoSlug}-${video.id}.webp`;
-
         const outputPath = path.join(optimizedThumbnailsDir, thumbnailFileName);
         const relativeThumbnailPath = `/${OPTIMIZED_IMAGES_SUBDIR}/${thumbnailFileName}`;
 
-        try {
-            if (video.thumbnail) {
-                let inputBuffer;
+        const processVideoPromise = (async () => {
+            try {
+                if (video.thumbnail) {
+                    let inputBuffer;
 
-                if (video.thumbnail.startsWith('http')) {
-                    console.log(`Downloading thumbnail for ${video.title} from ${video.thumbnail}`);
-                    const response = await fetch(video.thumbnail);
-                    if (!response.ok) {
-                        throw new Error(`Failed to download thumbnail: ${response.statusText}`);
+                    if (video.thumbnail.startsWith('http')) {
+                        // console.log(`Downloading thumbnail for ${video.title} from ${video.thumbnail}`); // Dihapus untuk kecepatan
+                        const response = await fetch(video.thumbnail);
+                        if (!response.ok) {
+                            throw new Error(`Failed to download thumbnail: ${response.statusText}`);
+                        }
+                        inputBuffer = Buffer.from(await response.arrayBuffer());
+                    } else {
+                        const localInputPath = path.join(publicDir, video.thumbnail);
+                        try {
+                            await fs.access(localInputPath);
+                            inputBuffer = await fs.readFile(localInputPath);
+                            // console.log(`Using local thumbnail for ${video.title}: ${localInputPath}`); // Dihapus untuk kecepatan
+                        } catch (localFileError) {
+                            console.error(`[ERROR] Local thumbnail file not found for ${video.title}: ${localFileError.message}`);
+                            throw new Error(`Local thumbnail not found or accessible: ${localFileError.message}`);
+                        }
                     }
-                    inputBuffer = Buffer.from(await response.arrayBuffer());
+
+                    const optimizedBuffer = await sharp(inputBuffer)
+                        .resize({ width: OPTIMIZED_THUMBNAIL_WIDTH, withoutEnlargement: true })
+                        .webp({ quality: 70 })
+                        .toBuffer();
+
+                    const optimizedMetadata = await sharp(optimizedBuffer).metadata();
+                    const finalWidth = optimizedMetadata.width || DEFAULT_FALLBACK_WIDTH;
+                    const finalHeight = optimizedMetadata.height || DEFAULT_FALLBACK_HEIGHT;
+
+                    await fs.writeFile(outputPath, optimizedBuffer);
+                    // console.log(`Processed and saved: ${outputPath} (Dimensions: ${finalWidth}x${finalHeight})`); // Dihapus untuk kecepatan
+
+                    return {
+                        ...video,
+                        thumbnail: relativeThumbnailPath,
+                        thumbnailWidth: finalWidth,
+                        thumbnailHeight: finalHeight,
+                    };
+
+                } else {
+                    console.warn(`No thumbnail URL found for video: ${video.title}. Using placeholder.`);
+                    return {
+                        ...video,
+                        thumbnail: PLACEHOLDER_THUMBNAIL_PATH,
+                        thumbnailWidth: DEFAULT_FALLBACK_WIDTH,
+                        thumbnailHeight: DEFAULT_FALLBACK_HEIGHT,
+                    };
                 }
-                else {
-                    const localInputPath = path.join(publicDir, video.thumbnail);
-                    try {
-                        await fs.access(localInputPath);
-                        inputBuffer = await fs.readFile(localInputPath);
-                        console.log(`Using local thumbnail for ${video.title}: ${localInputPath}`);
-                    } catch (localFileError) {
-                        console.error(`[ERROR] Local thumbnail file not found for ${video.title}: ${localFileError.message}`);
-                        throw new Error(`Local thumbnail not found or accessible: ${localFileError.message}`);
-                    }
-                }
-
-                const optimizedBuffer = await sharp(inputBuffer)
-                    .resize({ width: OPTIMIZED_THUMBNAIL_WIDTH, withoutEnlargement: true })
-                    .webp({ quality: 70 })
-                    .toBuffer();
-
-                const optimizedMetadata = await sharp(optimizedBuffer).metadata();
-                const finalWidth = optimizedMetadata.width || DEFAULT_FALLBACK_WIDTH;
-                const finalHeight = optimizedMetadata.height || DEFAULT_FALLBACK_HEIGHT;
-
-                await fs.writeFile(outputPath, optimizedBuffer);
-                console.log(`Processed and saved: ${outputPath} (Dimensions: ${finalWidth}x${finalHeight})`);
-
-                processedVideos.push({
-                    ...video,
-                    thumbnail: relativeThumbnailPath,
-                    thumbnailWidth: finalWidth,
-                    thumbnailHeight: finalHeight,
-                });
-
-            } else {
-                console.warn(`No thumbnail URL found for video: ${video.title}. Using placeholder.`);
-                processedVideos.push({
+            } catch (error) {
+                console.error(`Error processing thumbnail for video ${video.id} (${video.title}):`, error.message);
+                return {
                     ...video,
                     thumbnail: PLACEHOLDER_THUMBNAIL_PATH,
                     thumbnailWidth: DEFAULT_FALLBACK_WIDTH,
                     thumbnailHeight: DEFAULT_FALLBACK_HEIGHT,
-                });
+                };
             }
-        } catch (error) {
-            console.error(`Error processing thumbnail for video ${video.id} (${video.title}):`, error.message);
-            processedVideos.push({
-                ...video,
-                thumbnail: PLACEHOLDER_THUMBNAIL_PATH,
-                thumbnailWidth: DEFAULT_FALLBACK_WIDTH,
-                thumbnailHeight: DEFAULT_FALLBACK_HEIGHT,
-            });
+        })(); // Langsung panggil async IIFE untuk mendapatkan promise
+
+        processingPromises.push(processVideoPromise);
+
+        // Batasi konkurensi: Jika jumlah promise yang sedang berjalan melebihi batas, tunggu salah satunya selesai
+        if (processingPromises.length >= CONCURRENCY_LIMIT) {
+            await Promise.race(processingPromises);
+            // Hapus promise yang sudah selesai dari array
+            // Ini adalah pendekatan sederhana, lebih canggih bisa dengan Promise.allSettled dan filter
+            // Untuk skrip build, ini mungkin cukup
+            const resolvedIndex = await Promise.race(processingPromises.map((p, i) => p.then(() => i, () => i)));
+            processingPromises.splice(resolvedIndex, 1);
         }
     }
+
+    // Tunggu semua promise yang tersisa selesai
+    const results = await Promise.all(processingPromises);
+    processedVideos.push(...results.filter(Boolean)); // Tambahkan hasil yang valid
 
     const outputContent = `import type { VideoData } from '../utils/data';\n\nconst allVideos: VideoData[] = ${JSON.stringify(processedVideos, null, 2)};\n\nexport default allVideos;\n`;
     await fs.writeFile(OUTPUT_TS_PATH, outputContent, 'utf-8');
